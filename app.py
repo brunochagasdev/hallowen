@@ -1,26 +1,27 @@
-"""Halloween Colégio GDV - votação do concurso de fantasias (Streamlit + Google Sheets)."""
+"""Halloween Colégio GDV - votação de fantasias (Streamlit + Supabase)."""
 import html
 import logging
 import threading
+import unicodedata
 
 import pandas as pd
+import requests
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 
 logger = logging.getLogger(__name__)
-
-URL_PLANILHA_PADRAO = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1RGh0FRMgZGJTE-aXWGfHqYsdl0mzxZ5Qr-uXgKtcmmY/edit?gid=0#gid=0"
-)
 
 TURMAS = [
     "5º Ano", "6º Ano", "7º Ano", "8º Ano", "9º Ano",
     "1ª Série EM", "2ª Série EM", "3ª Série EM",
 ]
-CRITERIOS = ["Criatividade", "Execução", "Performance", "Adequação ao Tema"]
-NOTA_MAX = 2.5  # cada critério vale de 0.0 a 2.5 (total máximo 10.0)
-COLUNAS = ["Jurado", "Série/Ano", "Aluno", *CRITERIOS, "Nota Final"]
+# nome na tela -> coluna no banco
+CRITERIOS = {
+    "Criatividade": "criatividade",
+    "Execução": "execucao",
+    "Performance": "performance",
+    "Adequação ao Tema": "adequacao",
+}
+NOTA_MAX = 2.5
 
 CSS = """
 .hero{background:linear-gradient(135deg,#2A1245 0%,#4B1D7A 60%,#B4520C 140%);border:1px solid rgba(255,122,26,.35);border-radius:16px;padding:1.5rem 1.8rem;margin-bottom:1.1rem}
@@ -48,26 +49,16 @@ CSS = """
 
 
 # ----------------------------------------------------------------------------
-# Configuração e utilitários
+# Utilitários
 # ----------------------------------------------------------------------------
-def configuracao(chave, padrao=None):
-    """Lê um valor de st.secrets sem quebrar se o arquivo de secrets não existir."""
+def segredo(nome, padrao=None):
     try:
-        return st.secrets.get(chave, padrao)
+        return st.secrets.get(nome, padrao)
     except Exception:
         return padrao
 
 
-def url_planilha():
-    return configuracao("planilha_url", URL_PLANILHA_PADRAO)
-
-
-def conexao():
-    return st.connection("gsheets", type=GSheetsConnection)
-
-
 def esc(texto):
-    """Escapa texto digitado pelo usuário antes de inseri-lo em HTML."""
     return html.escape(str(texto))
 
 
@@ -76,71 +67,127 @@ def fmt(numero, casas=1):
 
 
 def limpar_texto(valor, limite=80):
-    """Normaliza espaços e remove caracteres que fariam o Sheets interpretar o texto como fórmula."""
     if valor is None or (not isinstance(valor, str) and pd.isna(valor)):
         return ""
-    texto = " ".join(str(valor).split())
-    return texto.lstrip("=+-@")[:limite].strip()
+    return " ".join(str(valor).split()).lstrip("=+-@")[:limite].strip()
 
 
 def chave(valor):
-    """Chave de comparação: ignora maiúsculas/minúsculas e espaços repetidos."""
+    """Chave de comparação: sem acentos, sem maiúsculas, sem espaços repetidos."""
     if valor is None or (not isinstance(valor, str) and pd.isna(valor)):
         return ""
-    return " ".join(str(valor).split()).casefold()
+    texto = unicodedata.normalize("NFKD", " ".join(str(valor).split()))
+    return "".join(c for c in texto if not unicodedata.combining(c)).casefold()
 
 
 def mostrar_tabela(df):
     try:
         st.dataframe(df, width="stretch", hide_index=True)
-    except Exception:  # versões antigas do Streamlit
+    except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # ----------------------------------------------------------------------------
-# Dados
+# Armazenamento
 # ----------------------------------------------------------------------------
-def ler_planilha(ttl):
-    df = conexao().read(spreadsheet=url_planilha(), ttl=ttl)
-    df = df.dropna(how="all")
-    for coluna in COLUNAS:
-        if coluna not in df.columns:
-            df[coluna] = pd.NA
-    return df.reset_index(drop=True)
+# Voto repetido é sinalizado com FileExistsError (exceção nativa): classes definidas aqui
+# seriam recriadas a cada execução do script e não seriam reconhecidas pelo objeto em cache.
 
 
-def preparar_votos(df):
-    """Mantém só votos válidos e recalcula a nota final a partir dos critérios."""
-    v = df.copy()
+class Supabase:
+    """Banco real. A regra de voto único é garantida por uma restrição UNIQUE na tabela."""
+
+    def __init__(self, url, chave_api):
+        self.url = url.rstrip("/") + "/rest/v1/votos"
+        self.headers = {"apikey": chave_api, "Content-Type": "application/json"}
+        if chave_api.startswith("eyJ"):  # chave no formato antigo (JWT)
+            self.headers["Authorization"] = f"Bearer {chave_api}"
+
+    def listar(self):
+        linhas, inicio = [], 0
+        while True:
+            r = requests.get(
+                self.url, headers=self.headers, timeout=15,
+                params={"select": "jurado,serie,aluno," + ",".join(CRITERIOS.values()),
+                        "order": "id", "limit": 1000, "offset": inicio},
+            )
+            if r.status_code != 200:
+                raise RuntimeError(f"Leitura falhou: HTTP {r.status_code}")
+            lote = r.json()
+            linhas += lote
+            if len(lote) < 1000:
+                return linhas
+            inicio += 1000
+
+    def inserir(self, voto):
+        r = requests.post(self.url, json=voto, timeout=15,
+                          headers={**self.headers, "Prefer": "return=minimal"})
+        if r.status_code == 409:
+            raise FileExistsError()
+        if r.status_code not in (200, 201, 204):
+            raise RuntimeError(f"Gravação falhou: HTTP {r.status_code}")
+
+
+class Memoria:
+    """Só para demonstração: os votos somem quando o app reinicia."""
+
+    def __init__(self):
+        self.linhas = []
+        self.trava = threading.Lock()
+
+    def listar(self):
+        return list(self.linhas)
+
+    def inserir(self, voto):
+        with self.trava:
+            if any((l["jurado_chave"], l["serie"], l["aluno_chave"]) ==
+                   (voto["jurado_chave"], voto["serie"], voto["aluno_chave"]) for l in self.linhas):
+                raise FileExistsError()
+            self.linhas.append(dict(voto))
+
+
+@st.cache_resource
+def armazenamento():
+    url, chave_api = segredo("supabase_url"), segredo("supabase_chave")
+    if url and chave_api:
+        return Supabase(str(url), str(chave_api)), False
+    return Memoria(), True
+
+
+@st.cache_data(ttl=10)
+def carregar(_arm):
+    return _arm.listar()
+
+
+# ----------------------------------------------------------------------------
+# Apuração
+# ----------------------------------------------------------------------------
+def preparar_votos(linhas):
+    colunas = ["Jurado", "Série/Ano", "Aluno", *CRITERIOS, "Nota Final"]
+    if not linhas:
+        return pd.DataFrame(columns=colunas), 0
+    v = pd.DataFrame(linhas).rename(columns={"jurado": "Jurado", "serie": "Série/Ano", "aluno": "Aluno",
+                                              **{b: n for n, b in CRITERIOS.items()}})
     for c in CRITERIOS:
-        v[c] = pd.to_numeric(v[c], errors="coerce")
-    for c in ["Jurado", "Série/Ano", "Aluno"]:
-        v[c] = v[c].map(lambda x: " ".join(str(x).split()) if pd.notna(x) else "")
-    validos = (
-        v[CRITERIOS].notna().all(axis=1)
-        & v[CRITERIOS].ge(0).all(axis=1)
-        & v[CRITERIOS].le(NOTA_MAX + 1e-9).all(axis=1)
-        & (v["Jurado"] != "")
-        & (v["Aluno"] != "")
-        & v["Série/Ano"].isin(TURMAS)
-    )
+        v[c] = pd.to_numeric(v.get(c), errors="coerce")
+    validos = (v[list(CRITERIOS)].notna().all(axis=1)
+               & v[list(CRITERIOS)].ge(0).all(axis=1)
+               & v[list(CRITERIOS)].le(NOTA_MAX + 1e-9).all(axis=1)
+               & v["Série/Ano"].isin(TURMAS))
     ignorados = int((~validos).sum())
     v = v[validos].copy()
-    v["Nota Final"] = v[CRITERIOS].sum(axis=1).round(1)
-    return v.reset_index(drop=True), ignorados
+    v["Nota Final"] = v[list(CRITERIOS)].sum(axis=1).round(1)
+    return v[colunas].reset_index(drop=True), ignorados
 
 
 def classificar(votos):
-    """Ranking pela média da nota final de cada aluno. Empates compartilham a posição."""
     colunas = ["Posição", "Série/Ano", "Aluno", "Média", "Avaliações", "Empate"]
     if votos.empty:
         return pd.DataFrame(columns=colunas)
     v = votos.assign(_k=votos["Aluno"].map(chave))
-    g = (
-        v.groupby(["Série/Ano", "_k"], sort=False)
-        .agg(Aluno=("Aluno", "first"), Média=("Nota Final", "mean"), Avaliações=("Nota Final", "size"))
-        .reset_index()
-    )
+    g = (v.groupby(["Série/Ano", "_k"], sort=False)
+         .agg(Aluno=("Aluno", "first"), Média=("Nota Final", "mean"), Avaliações=("Nota Final", "size"))
+         .reset_index())
     g["Média"] = g["Média"].round(2)
     g["Posição"] = g["Média"].rank(method="min", ascending=False).astype(int)
     g["Empate"] = g.duplicated("Posição", keep=False)
@@ -148,44 +195,8 @@ def classificar(votos):
     return g.reset_index(drop=True)[colunas]
 
 
-@st.cache_resource
-def trava_gravacao():
-    return threading.Lock()
-
-
-def registrar_voto(voto):
-    """Grava o voto. Relê a planilha dentro de uma trava para não sobrescrever votos de outros jurados."""
-    with trava_gravacao():
-        try:
-            atual = ler_planilha(ttl=0)
-        except Exception:
-            logger.exception("Falha ao reler a planilha antes de gravar")
-            return "erro_leitura"
-
-        duplicado = (
-            (atual["Jurado"].map(chave) == chave(voto["Jurado"]))
-            & (atual["Série/Ano"].map(chave) == chave(voto["Série/Ano"]))
-            & (atual["Aluno"].map(chave) == chave(voto["Aluno"]))
-        ).any()
-        if duplicado:
-            return "duplicado"
-
-        try:
-            novo = pd.DataFrame([voto])
-            conexao().update(
-                spreadsheet=url_planilha(),
-                data=pd.concat([atual, novo], ignore_index=True),
-            )
-        except Exception:
-            logger.exception("Falha ao gravar na planilha")
-            return "erro_gravacao"
-
-        st.cache_data.clear()
-        return "ok"
-
-
 # ----------------------------------------------------------------------------
-# Estado e ações do formulário
+# Ações do formulário
 # ----------------------------------------------------------------------------
 def inicializar_estado():
     padroes = {"rascunho": None, "aviso": None, "aluno": "", "serie": TURMAS[0]}
@@ -204,29 +215,20 @@ def revisar_voto():
     aluno = limpar_texto(st.session_state.get("aluno"))
     serie = st.session_state.get("serie")
     notas = {}
-    for i, criterio in enumerate(CRITERIOS):
+    for i, nome in enumerate(CRITERIOS):
         try:
-            notas[criterio] = round(float(st.session_state.get(f"nota_{i}", 0.0)), 1)
+            notas[nome] = round(float(st.session_state.get(f"nota_{i}", 0.0)), 1)
         except (TypeError, ValueError):
-            notas[criterio] = None
-
+            notas[nome] = None
     if not jurado or not aluno:
         avisar("error", "Informe o nome do jurado e o nome do aluno antes de revisar o voto.")
-        return
-    if serie not in TURMAS:
+    elif serie not in TURMAS:
         avisar("error", "Selecione a série/ano do aluno.")
-        return
-    if any(n is None or n < 0 or n > NOTA_MAX for n in notas.values()):
+    elif any(n is None or n < 0 or n > NOTA_MAX for n in notas.values()):
         avisar("error", f"Cada nota deve estar entre 0,0 e {fmt(NOTA_MAX)}.")
-        return
-
-    st.session_state["rascunho"] = {
-        "Jurado": jurado,
-        "Série/Ano": serie,
-        "Aluno": aluno,
-        **notas,
-        "Nota Final": round(sum(notas.values()), 1),
-    }
+    else:
+        st.session_state["rascunho"] = {"Jurado": jurado, "Série/Ano": serie, "Aluno": aluno,
+                                        **notas, "Nota Final": round(sum(notas.values()), 1)}
 
 
 def cancelar_revisao():
@@ -234,87 +236,84 @@ def cancelar_revisao():
 
 
 def confirmar_voto():
-    voto = st.session_state.get("rascunho")
-    if not voto:
+    r = st.session_state.get("rascunho")
+    if not r:
         return
-    resultado = registrar_voto(voto)
-    if resultado == "ok":
-        avisar("success", f"Voto registrado: {voto['Aluno']} ({voto['Série/Ano']}), "
-                          f"total de {fmt(voto['Nota Final'])} pontos.")
+    arm, _ = armazenamento()
+    payload = {
+        "jurado": r["Jurado"], "jurado_chave": chave(r["Jurado"]),
+        "serie": r["Série/Ano"],
+        "aluno": r["Aluno"], "aluno_chave": chave(r["Aluno"]),
+        **{coluna: r[nome] for nome, coluna in CRITERIOS.items()},
+    }
+    try:
+        arm.inserir(payload)
+    except FileExistsError:
+        avisar("warning", f"{r['Jurado']} já avaliou {r['Aluno']} ({r['Série/Ano']}). O voto não foi gravado "
+                          "de novo. Para corrigir uma nota, fale com a organização.")
+        st.session_state["rascunho"] = None
+    except Exception:
+        logger.exception("Falha ao gravar o voto")
+        avisar("error", "Não foi possível gravar o voto agora. Os dados continuam na tela: "
+                        "clique em Confirmar voto novamente.")
+    else:
+        carregar.clear()
+        avisar("success", f"Voto registrado: {r['Aluno']} ({r['Série/Ano']}), "
+                          f"total de {fmt(r['Nota Final'])} pontos.")
         st.session_state["rascunho"] = None
         st.session_state["aluno"] = ""
         for i in range(len(CRITERIOS)):
             st.session_state[f"nota_{i}"] = 0.0
-    elif resultado == "duplicado":
-        avisar("warning", f"{voto['Jurado']} já avaliou {voto['Aluno']} ({voto['Série/Ano']}). "
-                          "O voto não foi gravado novamente. Para corrigir uma nota, fale com a organização.")
-        st.session_state["rascunho"] = None
-    else:
-        avisar("error", "Não foi possível gravar o voto agora. Nada foi perdido: confira os dados "
-                        "e clique em Confirmar voto novamente.")
 
 
 # ----------------------------------------------------------------------------
 # Interface
 # ----------------------------------------------------------------------------
 def html_cabecalho(encerrada):
-    if encerrada:
-        selo = '<span class="badge encerrada">Votação encerrada</span>'
-    else:
-        selo = '<span class="badge aberta">Votação aberta</span>'
-    return (
-        '<div class="hero"><h1>Halloween Colégio GDV</h1>'
-        "<p>Concurso de fantasias. Avalie cada aluno nos quatro critérios, revise as notas e confirme o voto.</p>"
-        f"{selo}</div>"
-    )
+    selo = ('<span class="badge encerrada">Votação encerrada</span>' if encerrada
+            else '<span class="badge aberta">Votação aberta</span>')
+    return ('<div class="hero"><h1>Halloween Colégio GDV</h1>'
+            "<p>Concurso de fantasias. Avalie o aluno nos quatro critérios, revise as notas e confirme o voto.</p>"
+            f"{selo}</div>")
 
 
 def html_resumo(votos, ranking):
     jurados = votos["Jurado"].map(chave).nunique() if not votos.empty else 0
     itens = [(len(votos), "avaliações registradas"), (jurados, "jurados que já votaram"),
              (len(ranking), "alunos avaliados")]
-    cartoes = "".join(
-        f'<div class="stat"><div class="valor">{n}</div><div class="rotulo">{r}</div></div>' for n, r in itens
-    )
-    return f'<div class="stat-grid">{cartoes}</div>'
+    return '<div class="stat-grid">' + "".join(
+        f'<div class="stat"><div class="valor">{n}</div><div class="rotulo">{r}</div></div>'
+        for n, r in itens) + "</div>"
 
 
 def html_revisao(v):
-    linhas = "".join(
-        f'<div class="linha"><span>{esc(c)}</span><span>{fmt(v[c])}</span></div>' for c in CRITERIOS
-    )
-    return (
-        '<div class="card"><div class="titulo">Revise antes de confirmar</div>'
-        f'<div class="meta">Aluno: {esc(v["Aluno"])}. Série/ano: {esc(v["Série/Ano"])}. '
-        f'Jurado: {esc(v["Jurado"])}.</div>{linhas}'
-        f'<div class="linha total"><span>Nota total</span><span>{fmt(v["Nota Final"])} / 10,0</span></div></div>'
-    )
+    linhas = "".join(f'<div class="linha"><span>{esc(c)}</span><span>{fmt(v[c])}</span></div>'
+                     for c in CRITERIOS)
+    return ('<div class="card"><div class="titulo">Revise antes de confirmar</div>'
+            f'<div class="meta">Aluno: {esc(v["Aluno"])}. Série/ano: {esc(v["Série/Ano"])}. '
+            f'Jurado: {esc(v["Jurado"])}.</div>{linhas}'
+            f'<div class="linha total"><span>Nota total</span><span>{fmt(v["Nota Final"])} / 10,0</span></div></div>')
 
 
 def html_criterios():
-    linhas = "".join(
-        f'<div class="linha"><span>{esc(c)}</span><span>0,0 a {fmt(NOTA_MAX)}</span></div>' for c in CRITERIOS
-    )
-    return (
-        '<div class="card"><div class="titulo">Critérios de avaliação</div>'
-        f'{linhas}<div class="linha total"><span>Total máximo</span><span>10,0</span></div></div>'
-    )
+    linhas = "".join(f'<div class="linha"><span>{esc(c)}</span><span>0,0 a {fmt(NOTA_MAX)}</span></div>'
+                     for c in CRITERIOS)
+    return ('<div class="card"><div class="titulo">Critérios de avaliação</div>'
+            f'{linhas}<div class="linha total"><span>Total máximo</span><span>10,0</span></div></div>')
 
 
 def html_campeao(linha, empate):
     selo = "Empate no 1º lugar" if empate else "Campeão do Halloween"
-    return (
-        f'<div class="campeao"><div class="selo">{selo}</div>'
-        f'<div class="nome">{esc(linha["Aluno"])}</div>'
-        f'<div class="sub">{esc(linha["Série/Ano"])}. Média {fmt(linha["Média"], 2)} '
-        f'em {int(linha["Avaliações"])} avaliações</div></div>'
-    )
+    return (f'<div class="campeao"><div class="selo">{selo}</div>'
+            f'<div class="nome">{esc(linha["Aluno"])}</div>'
+            f'<div class="sub">{esc(linha["Série/Ano"])}. Média {fmt(linha["Média"], 2)} '
+            f'em {int(linha["Avaliações"])} avaliações</div></div>')
 
 
 def aba_votacao(votos, encerrada):
     col_form, col_info = st.columns([3, 2], gap="large")
     em_revisao = st.session_state["rascunho"] is not None
-    jurados = [limpar_texto(j) for j in list(configuracao("jurados", []) or [])]
+    jurados = [limpar_texto(j) for j in list(segredo("jurados", []) or [])]
 
     with col_form:
         if encerrada:
@@ -330,12 +329,11 @@ def aba_votacao(votos, encerrada):
             st.text_input("Nome do aluno", key="aluno", disabled=em_revisao)
             st.caption(f"Cada critério vale de 0,0 a {fmt(NOTA_MAX)}. A nota total aparece na revisão.")
             c1, c2 = st.columns(2)
-            for i, criterio in enumerate(CRITERIOS):
+            for i, nome in enumerate(CRITERIOS):
                 with (c1 if i % 2 == 0 else c2):
-                    st.number_input(criterio, min_value=0.0, max_value=NOTA_MAX, step=0.1,
-                                    format="%.1f", key=f"nota_{i}", disabled=em_revisao)
-            st.form_submit_button("Revisar voto", type="primary", on_click=revisar_voto,
-                                  disabled=em_revisao)
+                    st.number_input(nome, min_value=0.0, max_value=NOTA_MAX, step=0.1, format="%.1f",
+                                    key=f"nota_{i}", disabled=em_revisao)
+            st.form_submit_button("Revisar voto", type="primary", on_click=revisar_voto, disabled=em_revisao)
 
         if em_revisao:
             st.markdown(html_revisao(st.session_state["rascunho"]), unsafe_allow_html=True)
@@ -355,7 +353,6 @@ def aba_classificacao(votos, encerrada, ignorados):
     filtro = st.selectbox("Filtrar por série/ano", ["Todas", *TURMAS], key="filtro")
     dados = votos if filtro == "Todas" else votos[votos["Série/Ano"] == filtro]
     ranking = classificar(dados)
-
     if ranking.empty:
         st.info("Nenhum voto registrado para este filtro ainda.")
         return
@@ -370,16 +367,13 @@ def aba_classificacao(votos, encerrada, ignorados):
 
     exibir = ranking.assign(Observação=ranking["Empate"].map({True: "Empate", False: ""})).drop(columns="Empate")
     mostrar_tabela(exibir)
-    st.caption("A classificação usa a média das notas totais recebidas por cada aluno. "
-               "Alunos com a mesma média dividem a posição.")
+    st.caption("A classificação usa a média das notas totais de cada aluno. Médias iguais dividem a posição.")
 
     with st.expander("Ver notas por critério"):
-        detalhe = dados[["Série/Ano", "Aluno", *CRITERIOS, "Nota Final"]].sort_values("Aluno", key=lambda s: s.map(chave))
-        mostrar_tabela(detalhe)
-
+        detalhe = dados[["Série/Ano", "Aluno", *CRITERIOS, "Nota Final"]]
+        mostrar_tabela(detalhe.sort_values("Aluno", key=lambda s: s.map(chave)))
     if ignorados:
-        st.caption(f"{ignorados} linha(s) da planilha com dados incompletos ou fora dos limites "
-                   "foram ignoradas na apuração.")
+        st.caption(f"{ignorados} registro(s) inválido(s) foram ignorados na apuração.")
 
 
 def main():
@@ -387,18 +381,22 @@ def main():
     st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
     inicializar_estado()
 
-    encerrada = bool(configuracao("votacao_encerrada", False))
+    encerrada = bool(segredo("votacao_encerrada", False))
     st.markdown(html_cabecalho(encerrada), unsafe_allow_html=True)
 
+    arm, demonstracao = armazenamento()
+    if demonstracao:
+        st.warning("Modo demonstração: o banco de dados ainda não foi configurado. Os votos desta tela "
+                   "são apagados quando o app reinicia. Não use assim no dia do evento.")
     try:
-        bruto = ler_planilha(ttl=10)
+        linhas = carregar(arm)
     except Exception:
-        logger.exception("Falha ao ler a planilha de votos")
-        st.error("Não foi possível acessar a planilha de votos agora. Nenhum dado foi alterado. "
+        logger.exception("Falha ao ler os votos")
+        st.error("Não foi possível acessar o banco de votos agora. Nenhum dado foi alterado. "
                  "Atualize a página em instantes ou avise a organização.")
         st.stop()
 
-    votos, ignorados = preparar_votos(bruto)
+    votos, ignorados = preparar_votos(linhas)
     ranking_geral = classificar(votos)
     st.markdown(html_resumo(votos, ranking_geral), unsafe_allow_html=True)
 
